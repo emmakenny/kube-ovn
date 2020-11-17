@@ -5,12 +5,11 @@ IPv6=${IPv6:-false}
 ENABLE_SSL=${ENABLE_SSL:-false}
 ENABLE_MIRROR=${ENABLE_MIRROR:-false}
 HW_OFFLOAD=${HW_OFFLOAD:-false}
-IFACE=""                               # The nic to support container network, if empty will use the nic that the default route use
+IFACE=""                               # The nic to support container network can be a nic name or a group of regex separated by comma, if empty will use the nic that the default route use
 
 REGISTRY="kubeovn"
 VERSION="v1.6.0"
 IMAGE_PULL_POLICY="IfNotPresent"
-NAMESPACE="kube-system"                # The ns to deploy kube-ovn
 POD_CIDR="10.16.0.0/16"                # Do NOT overlap with NODE/SVC/JOIN CIDR
 SVC_CIDR="10.96.0.0/12"                # Do NOT overlap with NODE/POD/JOIN CIDR
 JOIN_CIDR="100.64.0.0/16"              # Do NOT overlap with NODE/POD/SVC CIDR
@@ -39,12 +38,16 @@ VLAN_RANGE="1,4095"
 DPDK="false"
 DPDK_SUPPORTED_VERSIONS=("19.11")
 DPDK_VERSION=""
+DPDK_CPU="1000m"                        # Default CPU configuration for if --dpdk-cpu flag is not included
+DPDK_MEMORY="2Gi"                       # Default Memory configuration for it --dpdk-memory flag is not included
 
 display_help() {
     echo "Usage: $0 [option...]"
     echo
     echo "  -h, --help               Print Help (this message) and exit"
     echo "  --with-dpdk=<version>    Install Kube-OVN with OVS-DPDK instead of kernel OVS"
+    echo "  --dpdk-cpu=<amount>m     Configure DPDK to use a specific amount of CPU"
+    echo "  --dpdk-memory=<amount>Gi Configure DPDK to use a specific amount of memory"
     echo
     exit 0
 }
@@ -64,6 +67,26 @@ then
           echo "Unsupported DPDK version: ${DPDK_VERSION}"
           echo "Supported DPDK versions: ${DPDK_SUPPORTED_VERSIONS[*]}"
           exit 1
+        fi
+      ;;
+      --dpdk-cpu=*)
+        DPDK_CPU="${1#*=}"
+        if [[ $DPDK_CPU =~ ^[0-9]+(m)$ ]]
+        then
+           echo "CPU $DPDK_CPU"
+        else
+           echo "$DPDK_CPU is not valid, please use the format --dpdk-cpu=<amount>m"
+           exit 1
+        fi
+      ;;
+      --dpdk-memory=*)
+        DPDK_MEMORY="${1#*=}"
+        if [[ $DPDK_MEMORY =~ ^[0-9]+(Gi)$ ]]
+        then
+           echo "MEMORY $DPDK_MEMORY"
+        else
+           echo "$DPDK_MEMORY is not valid, please use the format --dpdk-memory=<amount>Gi"
+           exit 1
         fi
       ;;
       -?*)
@@ -105,6 +128,96 @@ addresses=$(kubectl get no -lkube-ovn/role=master --no-headers -o wide | awk '{p
 echo "Install OVN DB in $addresses"
 
 cat <<EOF > kube-ovn-crd.yaml
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: vpcs.kubeovn.io
+spec:
+  group: kubeovn.io
+  versions:
+    - additionalPrinterColumns:
+        - jsonPath: .status.standby
+          name: Standby
+          type: boolean
+        - jsonPath: .status.subnets
+          name: Subnets
+          type: string
+      name: v1
+      schema:
+        openAPIV3Schema:
+          properties:
+            spec:
+              properties:
+                namespaces:
+                  items:
+                    type: string
+                  type: array
+                staticRoutes:
+                  items:
+                    properties:
+                      policy:
+                        type: string
+                      cidr:
+                        type: string
+                      nextHopIP:
+                        type: string
+                    type: object
+                  type: array
+              type: object
+            status:
+              properties:
+                conditions:
+                  items:
+                    properties:
+                      lastTransitionTime:
+                        type: string
+                      lastUpdateTime:
+                        type: string
+                      message:
+                        type: string
+                      reason:
+                        type: string
+                      status:
+                        type: string
+                      type:
+                        type: string
+                    type: object
+                  type: array
+                default:
+                  type: boolean
+                defaultLogicalSwitch:
+                  type: string
+                router:
+                  type: string
+                standby:
+                  type: boolean
+                subnets:
+                  items:
+                    type: string
+                  type: array
+                tcpLoadBalancer:
+                  type: string
+                tcpSessionLoadBalancer:
+                  type: string
+                udpLoadBalancer:
+                  type: string
+                udpSessionLoadBalancer:
+                  type: string
+              type: object
+          type: object
+      served: true
+      storage: true
+      subresources:
+        status: {}
+  names:
+    kind: Vpc
+    listKind: VpcList
+    plural: vpcs
+    shortNames:
+      - vpc
+    singular: vpc
+  scope: Cluster
+---
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
@@ -185,6 +298,9 @@ spec:
       subresources:
         status: {}
       additionalPrinterColumns:
+      - name: Vpc
+        type: string
+        jsonPath: .spec.vpc
       - name: Protocol
         type: string
         jsonPath: .spec.protocol
@@ -242,6 +358,8 @@ spec:
             spec:
               type: object
               properties:
+                vpc:
+                  type: string
                 default:
                   type: boolean
                 protocol:
@@ -275,6 +393,8 @@ spec:
                 vlan:
                   type: string
                 underlayGateway:
+                  type: boolean
+                disableInterConnection:
                   type: boolean
   scope: Cluster
   names:
@@ -365,14 +485,14 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: ovn-config
-  namespace: ${NAMESPACE}
+  namespace: kube-system
 
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ovn
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -447,14 +567,14 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: ovn
-    namespace:  ${NAMESPACE}
+    namespace: kube-system
 
 ---
 kind: Service
 apiVersion: v1
 metadata:
   name: ovn-nb
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 spec:
   ports:
     - name: ovn-nb
@@ -472,7 +592,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: ovn-sb
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 spec:
   ports:
     - name: ovn-sb
@@ -490,7 +610,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: kube-ovn-monitor
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   labels:
     app: kube-ovn-monitor
 spec:
@@ -506,7 +626,7 @@ kind: Deployment
 apiVersion: apps/v1
 metadata:
   name: ovn-central
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       OVN components: northd, nb and sb.
@@ -529,7 +649,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -540,6 +659,7 @@ spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
+      shareProcessNamespace: true
       containers:
         - name: ovn-central
           image: "$REGISTRY/kube-ovn:$VERSION"
@@ -697,7 +817,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: ovs-ovn
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       This daemon set launches the openvswitch daemon.
@@ -716,7 +836,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -783,11 +902,11 @@ spec:
             timeoutSeconds: 45
           resources:
             requests:
-              cpu: 500m
-              memory: 2Gi
+              cpu: $DPDK_CPU
+              memory: $DPDK_MEMORY
             limits:
-              cpu: 1000m
-              memory: 2Gi
+              cpu: $DPDK_CPU
+              memory: $DPDK_MEMORY
               hugepages-1Gi: 1Gi
       nodeSelector:
         kubernetes.io/os: "linux"
@@ -865,13 +984,13 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: ovn-config
-  namespace: ${NAMESPACE}
+  namespace: kube-system
 ---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
   name: ovn
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -888,6 +1007,8 @@ rules:
   - apiGroups:
       - "kubeovn.io"
     resources:
+      - vpcs
+      - vpcs/status
       - subnets
       - subnets/status
       - ips
@@ -945,13 +1066,13 @@ roleRef:
 subjects:
   - kind: ServiceAccount
     name: ovn
-    namespace:  ${NAMESPACE}
+    namespace: kube-system
 ---
 kind: Service
 apiVersion: v1
 metadata:
   name: ovn-nb
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 spec:
   ports:
     - name: ovn-nb
@@ -968,7 +1089,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: ovn-sb
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
 spec:
   ports:
     - name: ovn-sb
@@ -985,7 +1106,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: kube-ovn-monitor
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   labels:
     app: kube-ovn-monitor
 spec:
@@ -1001,7 +1122,7 @@ kind: Deployment
 apiVersion: apps/v1
 metadata:
   name: ovn-central
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       OVN components: northd, nb and sb.
@@ -1024,7 +1145,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1035,6 +1155,7 @@ spec:
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
+      shareProcessNamespace: true
       containers:
         - name: ovn-central
           image: "$REGISTRY/kube-ovn:$VERSION"
@@ -1191,7 +1312,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: ovs-ovn
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       This daemon set launches the openvswitch daemon.
@@ -1210,7 +1331,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1316,7 +1436,7 @@ fi
 
 kubectl apply -f kube-ovn-crd.yaml
 kubectl apply -f ovn.yaml
-kubectl rollout status deployment/ovn-central -n ${NAMESPACE}
+kubectl rollout status deployment/ovn-central -n kube-system
 echo "-------------------------------"
 echo ""
 
@@ -1328,7 +1448,7 @@ kind: Deployment
 apiVersion: apps/v1
 metadata:
   name: kube-ovn-controller
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       kube-ovn controller
@@ -1351,7 +1471,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       affinity:
         podAntiAffinity:
           requiredDuringSchedulingIgnoredDuringExecution:
@@ -1422,7 +1541,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: kube-ovn-cni
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       This daemon set launches the kube-ovn cni daemon.
@@ -1439,7 +1558,6 @@ spec:
     spec:
       tolerations:
       - operator: Exists
-        effect: NoSchedule
       priorityClassName: system-cluster-critical
       serviceAccountName: ovn
       hostNetwork: true
@@ -1537,7 +1655,7 @@ kind: DaemonSet
 apiVersion: apps/v1
 metadata:
   name: kube-ovn-pinger
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   annotations:
     kubernetes.io/description: |
       This daemon set launches the openvswitch daemon.
@@ -1556,7 +1674,6 @@ spec:
     spec:
       tolerations:
         - operator: Exists
-          effect: NoSchedule
       serviceAccountName: ovn
       hostPID: true
       containers:
@@ -1647,7 +1764,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: kube-ovn-pinger
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   labels:
     app: kube-ovn-pinger
 spec:
@@ -1661,7 +1778,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: kube-ovn-controller
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   labels:
     app: kube-ovn-controller
 spec:
@@ -1675,7 +1792,7 @@ kind: Service
 apiVersion: v1
 metadata:
   name: kube-ovn-cni
-  namespace:  ${NAMESPACE}
+  namespace: kube-system
   labels:
     app: kube-ovn-cni
 spec:
@@ -1687,8 +1804,8 @@ spec:
 EOF
 
 kubectl apply -f kube-ovn.yaml
-kubectl rollout status deployment/kube-ovn-controller -n ${NAMESPACE}
-kubectl rollout status daemonset/kube-ovn-cni -n ${NAMESPACE}
+kubectl rollout status deployment/kube-ovn-controller -n kube-system
+kubectl rollout status daemonset/kube-ovn-cni -n kube-system
 echo "-------------------------------"
 echo ""
 
@@ -1699,7 +1816,7 @@ for ns in $(kubectl get ns --no-headers -o  custom-columns=NAME:.metadata.name);
   done
 done
 
-kubectl rollout status daemonset/kube-ovn-pinger -n ${NAMESPACE}
+kubectl rollout status daemonset/kube-ovn-pinger -n kube-system
 kubectl rollout status deployment/coredns -n kube-system
 echo "-------------------------------"
 echo ""
@@ -1861,6 +1978,7 @@ vsctl(){
 }
 
 diagnose(){
+  kubectl get crd vpcs.kubeovn.io
   kubectl get crd subnets.kubeovn.io
   kubectl get crd ips.kubeovn.io
   kubectl get svc kube-dns -n kube-system
